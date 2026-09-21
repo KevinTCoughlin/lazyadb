@@ -1,0 +1,91 @@
+# lazyadb
+
+A lazydocker-style terminal UI for a **fleet** of Android devices — every
+attached phone, tablet, emulator, and wireless target in one keyboard-driven
+panel, with their logcat streams merged into a single tagged view.
+
+## Why another adb TUI
+
+There are already several good single-device adb TUIs. Every one of them
+rebuilds the same dashboard: pick a device, then look at its logcat, its
+shell, its files. Above them sits a cliff — self-hosted device-farm web apps
+(STF/Device Farmer) and paid SaaS device clouds.
+
+The gap is in between: *"I have six devices on a USB hub and over wireless
+debugging, and I want one panel."* lazyadb is fleet-first. The device set is
+the primary object, not a dropdown you choose from before the real UI starts.
+
+## Status
+
+Early. What works today:
+
+- **Fleet discovery** — continuous `adb devices -l` polling; devices appearing
+  and disappearing are picked up without a restart. USB and wireless
+  (`host:port`) targets are treated identically.
+- **Merged logcat** — one tail per online device, interleaved into a single
+  stream with a per-device color-coded column, so you can watch the whole
+  fleet react to the same action at once.
+- **Scope toggle** — `a` flips between the whole fleet and just the selected
+  device, without dropping the other tails.
+- **Filter, pause, clear** — substring filter across message and tag, pause to
+  read, clear to reset.
+
+Devices that are `offline` or `unauthorized` are listed with their state but
+not tailed.
+
+## Install
+
+```bash
+go install github.com/kevintcoughlin/lazyadb/cmd/lazyadb@latest
+```
+
+Requires Go 1.25+ and `adb` (Android platform-tools) on your `PATH`.
+
+## Usage
+
+```bash
+lazyadb                      # tail every attached device
+lazyadb -adb /opt/adb        # use a specific adb binary
+lazyadb -poll 5s             # re-scan for devices less aggressively
+```
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | move through the device list |
+| `a` | toggle between the whole fleet and the selected device |
+| `/` | filter by substring (message or tag); `enter` applies, `esc` clears |
+| `p` / `space` | pause the log |
+| `c` | clear the buffer |
+| `r` | rescan for devices now |
+| `q` | quit |
+
+## Architecture
+
+```
+cmd/lazyadb      entrypoint and flags
+internal/adb     thin wrapper around the adb binary; no fleet state
+internal/fleet   device set + one logcat tail per device, merged into one channel
+internal/ui      Bubble Tea front end
+```
+
+`internal/adb` deliberately knows nothing about the fleet, so it stays easy to
+test and to swap for a pure-Go adb client later. `internal/fleet` owns all the
+lifecycle: starting a tail when a device appears, cancelling it when the device
+goes away, and dropping lines rather than blocking when a busy fleet
+out-produces the UI (the drop count is shown in the status bar).
+
+## Roadmap
+
+The fleet thesis is only half-proved until write operations fan out too:
+
+- parallel `install` / `uninstall` across the fleet with per-device progress
+- fan-out `shell`, with output collated per device
+- `getprop` diff across devices (API level, ABI, build fingerprint)
+- wireless pairing flow (`adb pair`) as a first-class panel — currently the
+  worst UX in the stock tooling
+- device groups and saved selections
+- MCP server so an agent can drive the fleet
+
+## License
+
+MIT — see [LICENSE](LICENSE).

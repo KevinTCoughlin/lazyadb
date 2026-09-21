@@ -1,0 +1,4 @@
+/lazyadb
+*.test
+*.out
+.DS_Store
