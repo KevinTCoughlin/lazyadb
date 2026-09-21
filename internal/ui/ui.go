@@ -46,6 +46,8 @@ const (
 	modeNormal mode = iota
 	modeFilter
 	modeInstallPrompt
+	modePairCode
+	modePairAddr
 )
 
 // Model is the root Bubble Tea model.
@@ -71,6 +73,14 @@ type Model struct {
 	installOpts adb.InstallOptions
 	installJobs int
 	installErr  error
+
+	pairPanel    bool
+	pairBusy     bool
+	services     []adb.MDNSService
+	pairSelected int
+	pairAddr     string
+	pairResult   *fleet.PairResult
+	pairErr      error
 
 	width, height int
 	err           error
@@ -149,6 +159,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case installClosedMsg:
 		return m, nil
 
+	case discoverMsg:
+		// Only ever set an error here, never clear one: a discovery refresh
+		// follows every pair attempt, and clobbering pairErr with this
+		// message's nil would silently swallow a failed pair. Explicit
+		// actions (rescan, reopening the panel) clear it instead.
+		if msg.err != nil {
+			m.pairErr = msg.err
+		}
+		m.services = msg.services
+		if m.pairSelected >= len(m.services) {
+			m.pairSelected = max(0, len(m.services)-1)
+		}
+		return m, nil
+
+	case pairDoneMsg:
+		m.pairBusy = false
+		m.pairErr = msg.err
+		if msg.err == nil {
+			result := msg.result
+			m.pairResult = &result
+		}
+		// A newly connected device should show up in the fleet immediately,
+		// and the pairing service it was advertising is now gone.
+		return m, tea.Batch(m.refresh(), m.discover())
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -199,6 +234,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.mode != modeNormal {
 		return m.handleInputKey(msg)
 	}
+	if m.pairPanel {
+		return m.handlePairKey(msg)
+	}
 
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -231,6 +269,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeInstallPrompt
 		m.input = ""
 		m.installErr = nil
+	case "w":
+		m.pairPanel = true
+		m.pairSelected = 0
+		m.pairErr = nil
+		m.pairResult = nil
+		return m, m.discover()
 	case "esc":
 		// Cancel an install in flight; otherwise dismiss its results.
 		if m.install != nil {
@@ -251,9 +295,25 @@ func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		input, mode := strings.TrimSpace(m.input), m.mode
 		m.mode, m.input = modeNormal, ""
-		if mode == modeFilter {
+		switch mode {
+		case modeFilter:
 			m.filter = input
 			return m, nil
+		case modePairAddr:
+			if input == "" {
+				return m, nil
+			}
+			// Manual entry gives us the address; the code prompt comes next.
+			m.pairAddr = input
+			m.mode = modePairCode
+			return m, nil
+		case modePairCode:
+			if input == "" {
+				return m, nil
+			}
+			m.pairBusy = true
+			m.pairErr = nil
+			return m, m.pair(m.pairAddr, input)
 		}
 		if input == "" {
 			return m, nil
@@ -331,6 +391,12 @@ func (m Model) View() string {
 	bodyHeight := m.height - 2
 	if bodyHeight < 3 {
 		bodyHeight = 3
+	}
+
+	if m.pairPanel {
+		width := m.width - 4
+		panel := panelStyle.Width(width).Height(bodyHeight).Render(m.pairPanelView(width, bodyHeight))
+		return lipgloss.JoinVertical(lipgloss.Left, panel, m.pairStatusBar())
 	}
 
 	body := lipgloss.JoinHorizontal(
