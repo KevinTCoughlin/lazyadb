@@ -29,6 +29,14 @@ Early. What works today:
   device, without dropping the other tails.
 - **Filter, pause, clear** — substring filter across message and tag, pause to
   read, clear to reset.
+- **Wireless pairing** — `w` opens a pairing panel that discovers devices over
+  mDNS, takes the pairing code, and then *finds the connect port itself*. The
+  port a device shows you for pairing is not the port you connect on, so by
+  hand this means pairing and then digging the other port out of `adb mdns
+  services`. Manual address entry is there too, because mDNS does not survive
+  most corporate wifi.
+- **Parallel install** — `i` installs an APK to every online device at once,
+  with per-device results. One device failing never aborts the others.
 
 Devices that are `offline` or `unauthorized` are listed with their state but
 not tailed.
@@ -53,6 +61,8 @@ lazyadb -poll 5s             # re-scan for devices less aggressively
 | --- | --- |
 | `j` / `k` | move through the device list |
 | `a` | toggle between the whole fleet and the selected device |
+| `w` | open the wireless pairing panel |
+| `i` | install an APK across the current scope |
 | `/` | filter by substring (message or tag); `enter` applies, `esc` clears |
 | `p` / `space` | pause the log |
 | `c` | clear the buffer |
@@ -76,13 +86,13 @@ out-produces the UI (the drop count is shown in the status bar).
 
 ## Roadmap
 
-The fleet thesis is only half-proved until write operations fan out too:
+Honest framing: merged logcat and wireless pairing are the parts that earn
+their keep, because they are genuinely awkward to do in a shell loop. Fan-out
+writes are convenient, but `for s in $(adb devices ...)` is a real competitor
+there, so the per-device *reporting* is what matters, not the fan-out itself.
 
-- parallel `install` / `uninstall` across the fleet with per-device progress
 - fan-out `shell`, with output collated per device
 - `getprop` diff across devices (API level, ABI, build fingerprint)
-- wireless pairing flow (`adb pair`) as a first-class panel — currently the
-  worst UX in the stock tooling
 - device groups and saved selections
 - MCP server so an agent can drive the fleet
 
