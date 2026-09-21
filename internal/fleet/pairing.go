@@ -13,8 +13,11 @@ import (
 type PairResult struct {
 	PairAddr    string
 	ConnectAddr string
-	Connected   bool
-	Output      string
+	// DeviceID is the stable mDNS identity, which is what a later reconnect
+	// follows — the address it is paired with will not survive a reboot.
+	DeviceID  string
+	Connected bool
+	Output    string
 }
 
 // connectPollInterval is how often we re-query mDNS while waiting for a
@@ -59,11 +62,12 @@ func (f *Fleet) PairAndConnect(ctx context.Context, pairAddr, code string, waitF
 	// Pairing succeeded. Anything that fails from here is a connect problem,
 	// not a pairing problem, and must be reported as such — the user should
 	// not be sent back to re-enter a code that already worked.
-	addr, err := f.resolveConnectAddr(ctx, pairAddr, waitForConnect)
+	addr, deviceID, err := f.resolveConnectAddr(ctx, pairAddr, waitForConnect)
 	if err != nil {
 		return result, fmt.Errorf("paired, but %w", err)
 	}
 	result.ConnectAddr = addr
+	result.DeviceID = deviceID
 
 	connectOut, err := f.client.Connect(ctx, addr)
 	if connectOut != "" {
@@ -79,7 +83,7 @@ func (f *Fleet) PairAndConnect(ctx context.Context, pairAddr, code string, waitF
 
 // resolveConnectAddr finds the connect endpoint for the device we just paired
 // with, polling until it advertises one.
-func (f *Fleet) resolveConnectAddr(ctx context.Context, pairAddr string, wait time.Duration) (string, error) {
+func (f *Fleet) resolveConnectAddr(ctx context.Context, pairAddr string, wait time.Duration) (addr, deviceID string, err error) {
 	pairHost := hostOf(pairAddr)
 	deadline := time.Now().Add(wait)
 
@@ -97,17 +101,20 @@ func (f *Fleet) resolveConnectAddr(ctx context.Context, pairAddr string, wait ti
 					}
 				}
 			}
-			if addr := matchConnect(services, wantID, pairHost); addr != "" {
-				return addr, nil
+			if addr, id := matchConnect(services, wantID, pairHost); addr != "" {
+				if id == "" {
+					id = wantID
+				}
+				return addr, id, nil
 			}
 		}
 
 		if time.Now().After(deadline) {
-			return "", fmt.Errorf("no connect service appeared within %s: connect manually with `adb connect %s:<port>`", wait, pairHost)
+			return "", wantID, fmt.Errorf("no connect service appeared within %s: connect manually with `adb connect %s:<port>`", wait, pairHost)
 		}
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", wantID, ctx.Err()
 		case <-time.After(connectPollInterval):
 		}
 	}
@@ -116,20 +123,20 @@ func (f *Fleet) resolveConnectAddr(ctx context.Context, pairAddr string, wait ti
 // matchConnect prefers the device ID we paired with, and falls back to any
 // connectable service on the same host — some adb builds rotate the mDNS
 // instance name after pairing.
-func matchConnect(services []adb.MDNSService, wantID, host string) string {
+func matchConnect(services []adb.MDNSService, wantID, host string) (addr, deviceID string) {
 	if wantID != "" {
 		for _, s := range services {
 			if s.Connectable() && s.DeviceID() == wantID {
-				return s.Addr
+				return s.Addr, s.DeviceID()
 			}
 		}
 	}
 	for _, s := range services {
 		if s.Connectable() && hostOf(s.Addr) == host {
-			return s.Addr
+			return s.Addr, s.DeviceID()
 		}
 	}
-	return ""
+	return "", ""
 }
 
 func hostOf(addr string) string {
@@ -138,3 +145,7 @@ func hostOf(addr string) string {
 	}
 	return addr
 }
+
+// errNoAddress is returned when a known device has neither a live mDNS
+// advertisement nor a usable stored address.
+var errNoAddress = fmt.Errorf("no address: device is not advertising and has no saved address")

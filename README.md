@@ -35,6 +35,13 @@ Early. What works today:
   hand this means pairing and then digging the other port out of `adb mdns
   services`. Manual address entry is there too, because mDNS does not survive
   most corporate wifi.
+- **Reattaching to known devices** — paired devices are remembered and
+  reconnected at startup. Pairing survives a reboot but the *connection* does
+  not, and the connect port is dynamic, so reattaching follows the device's
+  mDNS identity to wherever it is now rather than retrying a saved address
+  that has usually gone stale. The saved address is kept as the fallback for
+  when mDNS is unavailable, and is rewritten whenever a device turns up
+  somewhere new.
 - **Parallel install** — `i` installs an APK to every online device at once,
   with per-device results. One device failing never aborts the others.
 
@@ -75,6 +82,7 @@ lazyadb -poll 5s             # re-scan for devices less aggressively
 cmd/lazyadb      entrypoint and flags
 internal/adb     thin wrapper around the adb binary; no fleet state
 internal/fleet   device set + one logcat tail per device, merged into one channel
+internal/known   remembered wireless devices, persisted as JSON
 internal/ui      Bubble Tea front end
 ```
 
