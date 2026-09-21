@@ -64,6 +64,12 @@ go install github.com/kevintcoughlin/lazyadb/cmd/lazyadb@latest
 
 Requires Go 1.25+ and `adb` (Android platform-tools) on your `PATH`.
 
+Built on [Bubble Tea](https://github.com/charmbracelet/bubbletea) with
+[Bubbles](https://github.com/charmbracelet/bubbles) for the scrolling viewport
+and text inputs. The logcat parsing and stack-trace folding are ours: there is
+no importable Go logcat parser, and the Go stack-trace libraries parse
+goroutine dumps, which are a different format entirely.
+
 ## Usage
 
 ```bash

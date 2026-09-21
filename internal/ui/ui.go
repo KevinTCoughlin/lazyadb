@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -64,8 +66,13 @@ type Model struct {
 	// selected device.
 	allDevices bool
 
-	logs   *logbuf.Buffer
-	paused bool
+	logs *logbuf.Buffer
+	// vp clips and scrolls the rendered log. The entry cursor below is still
+	// ours, because folding needs a selected *entry* and a viewport only
+	// knows about rows.
+	vp      viewport.Model
+	vpReady bool
+	paused  bool
 	// logFocus sends the arrow/jk keys to the log instead of the device list.
 	logFocus bool
 	// logSel is the scroll cursor into the filtered view; negative follows
@@ -73,8 +80,11 @@ type Model struct {
 	logSel   int
 	minLevel byte
 
-	mode   mode
-	input  string
+	mode mode
+	// input backs every prompt (filter, apk path, pairing code). bubbles
+	// handles the cursor, unicode, and editing keys that are tedious and
+	// easy to get subtly wrong by hand.
+	input  textinput.Model
 	filter string
 
 	install     *fleet.InstallRun
@@ -100,7 +110,12 @@ type Model struct {
 // New builds a Model. ctx governs the fleet's tails and is cancelled by the
 // caller on exit.
 func New(ctx context.Context, f *fleet.Fleet, interval time.Duration, installOpts adb.InstallOptions, installJobs int, store *known.Store) Model {
+	input := textinput.New()
+	input.Prompt = ""
+	input.CharLimit = 1024
+
 	return Model{
+		input:       input,
 		fleet:       f,
 		ctx:         ctx,
 		interval:    interval,
@@ -144,7 +159,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		return m, nil
+		logWidth, bodyHeight := m.logDimensions()
+		if m.vpReady {
+			m.vp.Width, m.vp.Height = logWidth-2, bodyHeight-2
+		} else {
+			m.vp = viewport.New(logWidth-2, bodyHeight-2)
+			m.vpReady = true
+		}
+		return m.refreshLogView(), nil
 
 	case tickMsg:
 		return m, tea.Batch(m.refresh(), tick(m.interval))
@@ -160,6 +182,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case lineMsg:
 		if !m.paused {
 			m.logs.Append(fleet.Line(msg))
+			m = m.refreshLogView()
 		}
 		return m, waitForLine(m.fleet.Lines())
 
@@ -275,35 +298,38 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// back later to a view frozen somewhere in the past.
 			m.logSel = -1
 		}
+		return m.refreshLogView(), nil
 	case "j", "down":
 		if m.logFocus {
-			return m.scrollLog(1), nil
+			return m.scrollLog(1).refreshLogView(), nil
 		}
 		if m.selected < len(m.devices)-1 {
 			m.selected++
 		}
 	case "k", "up":
 		if m.logFocus {
-			return m.scrollLog(-1), nil
+			return m.scrollLog(-1).refreshLogView(), nil
 		}
 		if m.selected > 0 {
 			m.selected--
 		}
 	case "ctrl+d", "pgdown":
 		if m.logFocus {
-			return m.scrollLog(10), nil
+			return m.scrollLog(10).refreshLogView(), nil
 		}
 	case "ctrl+u", "pgup":
 		if m.logFocus {
-			return m.scrollLog(-10), nil
+			return m.scrollLog(-10).refreshLogView(), nil
 		}
 	case "g":
 		if m.logFocus {
 			m.logSel = 0
+			return m.refreshLogView(), nil
 		}
 	case "G":
 		if m.logFocus {
 			m.logSel = -1
+			return m.refreshLogView(), nil
 		}
 	case "enter":
 		// Fold or unfold the selected stack trace.
@@ -312,28 +338,31 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if sel := m.logSelection(len(entries)); sel >= 0 && entries[sel].IsTrace() {
 				entries[sel].Expanded = !entries[sel].Expanded
 			}
+			return m.refreshLogView(), nil
 		}
 	case "e":
 		m.minLevel = nextMinLevel(m.minLevel)
+		return m.refreshLogView(), nil
 	case "a":
 		m.allDevices = !m.allDevices
+		return m.refreshLogView(), nil
 	case "p", " ":
 		m.paused = !m.paused
 	case "c":
 		m.logs.Clear()
 		m.logSel = -1
+		return m.refreshLogView(), nil
 	case "r":
 		return m, m.refresh()
 	case "/":
-		m.mode = modeFilter
-		m.input = m.filter
+		m = m.openPrompt(modeFilter)
+		m.input.SetValue(m.filter)
 	case "i":
 		if len(m.installTargets()) == 0 {
 			m.installErr = errNoTargets
 			return m, nil
 		}
-		m.mode = modeInstallPrompt
-		m.input = ""
+		m = m.openPrompt(modeInstallPrompt)
 		m.installErr = nil
 	case "w":
 		m.pairPanel = true
@@ -393,48 +422,60 @@ func nextMinLevel(level byte) byte {
 func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEnter:
-		input, mode := strings.TrimSpace(m.input), m.mode
-		m.mode, m.input = modeNormal, ""
+		value, mode := strings.TrimSpace(m.input.Value()), m.mode
+		m = m.closePrompt()
 		switch mode {
 		case modeFilter:
-			m.filter = input
-			return m, nil
+			m.filter = value
+			return m.refreshLogView(), nil
 		case modePairAddr:
-			if input == "" {
+			if value == "" {
 				return m, nil
 			}
 			// Manual entry gives us the address; the code prompt comes next.
-			m.pairAddr = input
-			m.mode = modePairCode
-			return m, nil
+			m.pairAddr = value
+			return m.openPrompt(modePairCode), nil
 		case modePairCode:
-			if input == "" {
+			if value == "" {
 				return m, nil
 			}
 			m.pairBusy = true
 			m.pairErr = nil
-			return m, m.pair(m.pairAddr, input)
+			return m, m.pair(m.pairAddr, value)
 		}
-		if input == "" {
+		if value == "" {
 			return m, nil
 		}
-		return m.startInstall(expandHome(input))
+		return m.startInstall(expandHome(value))
+
 	case tea.KeyEsc:
 		if m.mode == modeFilter {
 			m.filter = ""
+			m = m.refreshLogView()
 		}
-		m.mode, m.input = modeNormal, ""
-	case tea.KeyBackspace:
-		if m.input != "" {
-			runes := []rune(m.input)
-			m.input = string(runes[:len(runes)-1])
-		}
-	case tea.KeySpace:
-		m.input += " "
-	case tea.KeyRunes:
-		m.input += string(msg.Runes)
+		return m.closePrompt(), nil
 	}
-	return m, nil
+
+	// Everything else — editing keys, unicode, cursor movement — is the
+	// component's job.
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// openPrompt focuses the shared input for a mode, starting empty.
+func (m Model) openPrompt(mode mode) Model {
+	m.mode = mode
+	m.input.SetValue("")
+	m.input.Focus()
+	return m
+}
+
+func (m Model) closePrompt() Model {
+	m.mode = modeNormal
+	m.input.SetValue("")
+	m.input.Blur()
+	return m
 }
 
 // persistReconnects writes back the address a device actually answered on.
@@ -521,16 +562,7 @@ func (m Model) View() string {
 		return "starting lazyadb…"
 	}
 
-	// Each panel's lipgloss Width covers its padding but not its border, so
-	// both borders (2 columns each) come out of the log panel's share.
-	logWidth := m.width - devicePanelWidth - 4
-	if logWidth < 20 {
-		logWidth = 20
-	}
-	bodyHeight := m.height - 2
-	if bodyHeight < 3 {
-		bodyHeight = 3
-	}
+	logWidth, bodyHeight := m.logDimensions()
 
 	if m.pairPanel {
 		width := m.width - 4
@@ -663,51 +695,77 @@ func (m Model) logPanel(width, height int) string {
 		header += dimStyle.Render("  [scroll]")
 	}
 
-	entries := m.visibleEntries()
-	rows := height - 3
-
-	// Flatten entries to display rows, expanding any open traces. Windowing
-	// happens on rows so an expanded trace can't overflow the panel.
-	lines := make([]string, 0, rows+8)
-	marks := make([]bool, 0, rows+8)
-	for i, entry := range entries {
-		selected := m.logFocus && i == m.logSelection(len(entries))
-		lines = append(lines, m.renderEntry(entry, width-2, selected))
-		marks = append(marks, selected)
-		if entry.Expanded {
-			for _, frame := range entry.Frames {
-				lines = append(lines, dimStyle.Render("             "+truncate(frame, width-16)))
-				marks = append(marks, false)
-			}
-		}
-	}
-
-	start := 0
-	if len(lines) > rows {
-		start = len(lines) - rows
-		// When scrolled back, keep the selected entry on screen.
-		if m.logFocus {
-			for i, isSel := range marks {
-				if isSel && i < start {
-					start = i
-					break
-				}
-			}
-		}
-	}
-	end := start + rows
-	if end > len(lines) {
-		end = len(lines)
-	}
-
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteString("\n")
-	for _, line := range lines[start:end] {
-		b.WriteString(line)
-		b.WriteString("\n")
-	}
+	b.WriteString(m.vp.View())
 	return b.String()
+}
+
+// logDimensions is the log panel's outer width and the body height. Each
+// panel's lipgloss Width covers its padding but not its border, so both
+// borders (2 columns each) come out of the log panel's share.
+func (m Model) logDimensions() (logWidth, bodyHeight int) {
+	logWidth = m.width - devicePanelWidth - 4
+	if logWidth < 20 {
+		logWidth = 20
+	}
+	bodyHeight = m.height - 2
+	if bodyHeight < 3 {
+		bodyHeight = 3
+	}
+	return logWidth, bodyHeight
+}
+
+// renderLogRows flattens entries to display rows, expanding open traces, and
+// returns the row index of the selected entry so the viewport can be scrolled
+// to keep it visible.
+func (m Model) renderLogRows(width int) (rows []string, cursorRow int) {
+	entries := m.visibleEntries()
+	selection := m.logSelection(len(entries))
+	cursorRow = -1
+
+	rows = make([]string, 0, len(entries))
+	for i, entry := range entries {
+		selected := m.logFocus && i == selection
+		if selected {
+			cursorRow = len(rows)
+		}
+		rows = append(rows, m.renderEntry(entry, width, selected))
+		if entry.Expanded {
+			for _, frame := range entry.Frames {
+				rows = append(rows, dimStyle.Render("             "+truncate(frame, width-14)))
+			}
+		}
+	}
+	return rows, cursorRow
+}
+
+// refreshLogView re-renders the log into the viewport. Called whenever the
+// content or the selection changes, keeping View() free of mutation.
+func (m Model) refreshLogView() Model {
+	if !m.vpReady {
+		return m
+	}
+
+	rows, cursorRow := m.renderLogRows(m.vp.Width)
+	m.vp.SetContent(strings.Join(rows, "\n"))
+
+	if !m.logFocus || m.logSel < 0 {
+		// Following the tail is the default and what you want while watching
+		// live output.
+		m.vp.GotoBottom()
+		return m
+	}
+	// Scroll only as far as needed to bring the cursor into view, so paging
+	// around doesn't jump the window more than it has to.
+	switch {
+	case cursorRow < m.vp.YOffset:
+		m.vp.SetYOffset(cursorRow)
+	case cursorRow >= m.vp.YOffset+m.vp.Height:
+		m.vp.SetYOffset(cursorRow - m.vp.Height + 1)
+	}
+	return m
 }
 
 // visibleEntries applies the device scope, text filter, and minimum level.
@@ -789,10 +847,10 @@ func (m Model) indexOf(serial string) int {
 func (m Model) statusBar() string {
 	switch m.mode {
 	case modeFilter:
-		return statusStyle.Render("/" + m.input + "▎  enter: apply  esc: clear")
+		return statusStyle.Render("/" + m.input.View() + "  enter: apply  esc: clear")
 	case modeInstallPrompt:
 		scope := fmt.Sprintf("%d device(s)", len(m.installTargets()))
-		return statusStyle.Render("install apk → " + scope + ": " + m.input + "▎  enter: run  esc: cancel")
+		return statusStyle.Render("install apk → " + scope + ": " + m.input.View() + "  enter: run  esc: cancel")
 	}
 
 	if m.installErr != nil {
