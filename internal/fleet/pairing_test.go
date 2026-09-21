@@ -132,10 +132,11 @@ func TestMatchConnectFallsBackToHost(t *testing.T) {
 	}
 	// The device ID rotated after pairing, so the ID match misses and the
 	// host match has to carry it.
-	if got, want := matchConnect(services, "DEV123", "192.168.1.40"), "192.168.1.40:42137"; got != want {
+	if got, _ := matchConnect(services, "DEV123", "192.168.1.40"); got != "192.168.1.40:42137" {
+		want := "192.168.1.40:42137"
 		t.Errorf("matchConnect() = %q, want %q", got, want)
 	}
-	if got := matchConnect(services, "DEV123", "10.0.0.1"); got != "" {
+	if got, _ := matchConnect(services, "DEV123", "10.0.0.1"); got != "" {
 		t.Errorf("matchConnect() = %q, want empty for an unknown host", got)
 	}
 }

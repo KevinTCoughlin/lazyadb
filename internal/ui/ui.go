@@ -16,6 +16,7 @@ import (
 
 	"github.com/kevintcoughlin/lazyadb/internal/adb"
 	"github.com/kevintcoughlin/lazyadb/internal/fleet"
+	"github.com/kevintcoughlin/lazyadb/internal/known"
 )
 
 const (
@@ -74,6 +75,8 @@ type Model struct {
 	installJobs int
 	installErr  error
 
+	store        *known.Store
+	reconnected  []fleet.ReconnectResult
 	pairPanel    bool
 	pairBusy     bool
 	services     []adb.MDNSService
@@ -89,7 +92,7 @@ type Model struct {
 
 // New builds a Model. ctx governs the fleet's tails and is cancelled by the
 // caller on exit.
-func New(ctx context.Context, f *fleet.Fleet, interval time.Duration, installOpts adb.InstallOptions, installJobs int) Model {
+func New(ctx context.Context, f *fleet.Fleet, interval time.Duration, installOpts adb.InstallOptions, installJobs int, store *known.Store) Model {
 	return Model{
 		fleet:       f,
 		ctx:         ctx,
@@ -97,11 +100,14 @@ func New(ctx context.Context, f *fleet.Fleet, interval time.Duration, installOpt
 		allDevices:  true,
 		installOpts: installOpts,
 		installJobs: installJobs,
+		store:       store,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.refresh(), waitForLine(m.fleet.Lines()), tick(m.interval))
+	// Reattaching to known wireless devices runs alongside the first device
+	// scan rather than blocking it, so USB devices show up immediately.
+	return tea.Batch(m.refresh(), waitForLine(m.fleet.Lines()), tick(m.interval), m.reconnectKnown())
 }
 
 func (m Model) refresh() tea.Cmd {
@@ -173,12 +179,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case discoverTickMsg:
+		// Only keep sweeping while the panel is actually open.
+		if !m.pairPanel {
+			return m, nil
+		}
+		return m, tea.Batch(m.discover(), discoverTick())
+
+	case reconnectMsg:
+		m.reconnected = msg.results
+		m.persistReconnects(msg.results)
+		// A device that came back should appear in the fleet right away.
+		return m, m.refresh()
+
 	case pairDoneMsg:
 		m.pairBusy = false
 		m.pairErr = msg.err
 		if msg.err == nil {
 			result := msg.result
 			m.pairResult = &result
+			m.rememberPaired(result)
 		}
 		// A newly connected device should show up in the fleet immediately,
 		// and the pairing service it was advertising is now gone.
@@ -274,7 +294,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.pairSelected = 0
 		m.pairErr = nil
 		m.pairResult = nil
-		return m, m.discover()
+		return m, tea.Batch(m.discover(), discoverTick())
 	case "esc":
 		// Cancel an install in flight; otherwise dismiss its results.
 		if m.install != nil {
@@ -335,6 +355,45 @@ func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input += string(msg.Runes)
 	}
 	return m, nil
+}
+
+// persistReconnects writes back the address a device actually answered on.
+//
+// This matters precisely when mDNS is unavailable: the stored address is the
+// only fallback then, so leaving a known-stale one on disk defeats the point
+// of storing it at all. It also refreshes LastConnected, which orders the list.
+func (m Model) persistReconnects(results []fleet.ReconnectResult) {
+	if m.store == nil {
+		return
+	}
+	for _, r := range results {
+		if !r.Connected || r.Addr == "" {
+			continue
+		}
+		if !r.Rediscovered && r.Addr == r.Device.Addr && !r.Device.LastConnected.IsZero() {
+			continue
+		}
+		_ = m.fleet.RememberConnected(m.store, r.Device.DeviceID, r.Addr, r.Device.Label)
+	}
+}
+
+// rememberPaired records a newly connected wireless device so a later run can
+// reattach to it. Without a device ID there is nothing durable to store — the
+// address alone goes stale — so that case is skipped rather than saved.
+func (m Model) rememberPaired(result fleet.PairResult) {
+	if m.store == nil || !result.Connected || result.DeviceID == "" {
+		return
+	}
+	var label string
+	for _, d := range m.devices {
+		if d.Serial == result.ConnectAddr {
+			label = d.Label()
+			break
+		}
+	}
+	// A store write failing must not derail a successful pair; the panel
+	// already shows the connection, and the cost is re-pairing next time.
+	_ = m.fleet.RememberConnected(m.store, result.DeviceID, result.ConnectAddr, label)
 }
 
 // selectedFailure is the full adb failure for the highlighted device, or "".

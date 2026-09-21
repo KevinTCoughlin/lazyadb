@@ -16,9 +16,39 @@ import (
 // advertising its connect service.
 const connectWait = 10 * time.Second
 
+// discoverInterval re-sweeps mDNS while the pairing panel is open, so a
+// device you put into pairing mode shows up on its own rather than after a
+// keypress you had to know about.
+const discoverInterval = 2 * time.Second
+
 type discoverMsg struct {
 	services []adb.MDNSService
 	err      error
+}
+
+// discoverTickMsg drives the auto-refresh while the panel is open.
+type discoverTickMsg time.Time
+
+type reconnectMsg struct {
+	results []fleet.ReconnectResult
+}
+
+func discoverTick() tea.Cmd {
+	return tea.Tick(discoverInterval, func(t time.Time) tea.Msg { return discoverTickMsg(t) })
+}
+
+// reconnectKnown reattaches to previously paired devices at startup.
+func (m Model) reconnectKnown() tea.Cmd {
+	if m.store == nil {
+		return nil
+	}
+	devices := m.store.List()
+	if len(devices) == 0 {
+		return nil
+	}
+	return func() tea.Msg {
+		return reconnectMsg{results: m.fleet.Reconnect(m.ctx, devices)}
+	}
 }
 
 type pairDoneMsg struct {
@@ -50,6 +80,19 @@ func (m Model) connect(addr string) tea.Cmd {
 	}
 }
 
+func (m Model) disconnect(svc adb.MDNSService) tea.Cmd {
+	store := m.store
+	return func() tea.Msg {
+		err := m.fleet.Disconnect(m.ctx, svc.Addr)
+		if err == nil && store != nil {
+			// Forgetting is best-effort: a store write failing should not be
+			// reported as a failed disconnect, because the disconnect worked.
+			_ = store.Forget(svc.DeviceID())
+		}
+		return pairDoneMsg{result: fleet.PairResult{ConnectAddr: svc.Addr}, err: err}
+	}
+}
+
 // handlePairKey drives the pairing panel while it is open and no text input
 // is active.
 func (m Model) handlePairKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -73,6 +116,16 @@ func (m Model) handlePairKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		m.pairErr = nil
 		return m, m.discover()
+	case "d":
+		// Disconnect and forget. Pairing itself lives on the device, so this
+		// only drops the connection and our memory of it.
+		svc, ok := m.selectedService()
+		if !ok || !svc.Connectable() {
+			return m, nil
+		}
+		m.pairErr = nil
+		m.pairResult = nil
+		return m, m.disconnect(svc)
 	case "m":
 		// mDNS is unreliable across VLANs and locked-down corporate wifi, so
 		// typing the address off the device's screen has to stay possible.
@@ -112,6 +165,11 @@ func (m Model) pairPanelView(width, height int) string {
 	if m.pairBusy {
 		b.WriteString(dimStyle.Render("pairing…"))
 		b.WriteString("\n")
+	}
+
+	if summary := m.reconnectSummary(); summary != "" {
+		b.WriteString(summary)
+		b.WriteString("\n\n")
 	}
 
 	if len(m.services) == 0 {
@@ -168,6 +226,36 @@ func (m Model) serviceList(width, height int) string {
 	return b.String()
 }
 
+// reconnectSummary reports what startup reconnection did. Rediscovered
+// devices are called out specifically, because "it came back on a different
+// port" is the thing a user would otherwise waste time discovering by hand.
+func (m Model) reconnectSummary() string {
+	if len(m.reconnected) == 0 {
+		return ""
+	}
+	var connected, moved, failed int
+	for _, r := range m.reconnected {
+		switch {
+		case r.Connected && r.Rediscovered:
+			connected++
+			moved++
+		case r.Connected:
+			connected++
+		default:
+			failed++
+		}
+	}
+
+	msg := fmt.Sprintf("reattached %d/%d known device(s)", connected, len(m.reconnected))
+	if moved > 0 {
+		msg += fmt.Sprintf(", %d on a new port", moved)
+	}
+	if failed > 0 {
+		msg += fmt.Sprintf(", %d unreachable", failed)
+	}
+	return dimStyle.Render(msg)
+}
+
 func (m Model) pairResultView() string {
 	r := m.pairResult
 	if !r.Connected {
@@ -195,5 +283,5 @@ func (m Model) pairStatusBar() string {
 	if m.pairBusy {
 		return statusStyle.Render("pairing…")
 	}
-	return statusStyle.Render("j/k: select  enter: pair/connect  m: manual  r: rescan  w/esc: close  q: quit")
+	return statusStyle.Render("j/k: select  enter: pair/connect  d: disconnect  m: manual  r: rescan  w/esc: close  q: quit")
 }
