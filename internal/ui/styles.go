@@ -1,6 +1,10 @@
 package ui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/kevintcoughlin/lazyadb/internal/fleet"
+)
 
 var (
 	panelStyle = lipgloss.NewStyle().
@@ -43,6 +47,23 @@ func levelStyle(level byte) lipgloss.Style {
 		color = "244"
 	}
 	return lipgloss.NewStyle().Bold(true).Foreground(color)
+}
+
+// installGlyph maps an install state to a marker and color. The glyphs are
+// ASCII-safe on purpose: this panel is the one you read across a room while
+// six devices flash, and box-drawing spinners render badly over ssh.
+func installGlyph(state fleet.InstallState) (string, lipgloss.Style) {
+	switch state {
+	case fleet.InstallRunning:
+		return "»", lipgloss.NewStyle().Foreground(lipgloss.Color("215"))
+	case fleet.InstallSucceeded:
+		return "✓", lipgloss.NewStyle().Foreground(lipgloss.Color("150"))
+	case fleet.InstallFailed:
+		return "✗", lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	case fleet.InstallCancelled:
+		return "-", lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	}
+	return "·", dimStyle
 }
 
 func levelRune(level byte) rune {
