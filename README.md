@@ -25,6 +25,14 @@ Early. What works today:
 - **Merged logcat** — one tail per online device, interleaved into a single
   stream with a per-device color-coded column, so you can watch the whole
   fleet react to the same action at once.
+- **Stack traces survive merging** — a Java trace is many consecutive lines,
+  and interleaving two devices' output shreds both of them. Frames are folded
+  back onto the line that threw, per device, so a trace stays one collapsible
+  entry no matter what else was arriving at the time. `enter` expands it.
+- **Scrollback** — `tab` moves the keyboard into the log: `j`/`k` to move,
+  `^u`/`^d` to page, `g`/`G` for top and bottom. Reaching the bottom resumes
+  following the tail, so you never get stranded in the past.
+- **Level filter** — `e` cycles all → warnings → errors.
 - **Scope toggle** — `a` flips between the whole fleet and just the selected
   device, without dropping the other tails.
 - **Filter, pause, clear** — substring filter across message and tag, pause to
@@ -56,6 +64,12 @@ go install github.com/kevintcoughlin/lazyadb/cmd/lazyadb@latest
 
 Requires Go 1.25+ and `adb` (Android platform-tools) on your `PATH`.
 
+Built on [Bubble Tea](https://github.com/charmbracelet/bubbletea) with
+[Bubbles](https://github.com/charmbracelet/bubbles) for the scrolling viewport
+and text inputs. The logcat parsing and stack-trace folding are ours: there is
+no importable Go logcat parser, and the Go stack-trace libraries parse
+goroutine dumps, which are a different format entirely.
+
 ## Usage
 
 ```bash
@@ -68,6 +82,10 @@ lazyadb -poll 5s             # re-scan for devices less aggressively
 | --- | --- |
 | `j` / `k` | move through the device list |
 | `a` | toggle between the whole fleet and the selected device |
+| `tab` | move the keyboard between the device list and the log |
+| `j`/`k`, `^u`/`^d`, `g`/`G` | scroll the log (when focused) |
+| `enter` | expand or fold the selected stack trace |
+| `e` | cycle minimum level: all → warnings → errors |
 | `w` | open the wireless pairing panel |
 | `i` | install an APK across the current scope |
 | `/` | filter by substring (message or tag); `enter` applies, `esc` clears |
@@ -83,6 +101,7 @@ cmd/lazyadb      entrypoint and flags
 internal/adb     thin wrapper around the adb binary; no fleet state
 internal/fleet   device set + one logcat tail per device, merged into one channel
 internal/known   remembered wireless devices, persisted as JSON
+internal/logbuf  merged log buffer: trace folding, filtering, level
 internal/ui      Bubble Tea front end
 ```
 

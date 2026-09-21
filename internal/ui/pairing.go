@@ -129,8 +129,7 @@ func (m Model) handlePairKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "m":
 		// mDNS is unreliable across VLANs and locked-down corporate wifi, so
 		// typing the address off the device's screen has to stay possible.
-		m.mode = modePairAddr
-		m.input = ""
+		m = m.openPrompt(modePairAddr)
 		m.pairErr = nil
 	case "enter":
 		svc, ok := m.selectedService()
@@ -144,8 +143,7 @@ func (m Model) handlePairKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.connect(svc.Addr)
 		}
 		m.pairAddr = svc.Addr
-		m.mode = modePairCode
-		m.input = ""
+		m = m.openPrompt(modePairCode)
 	}
 	return m, nil
 }
@@ -273,9 +271,9 @@ func (m Model) pairResultView() string {
 func (m Model) pairStatusBar() string {
 	switch m.mode {
 	case modePairCode:
-		return statusStyle.Render(fmt.Sprintf("pairing code for %s: %s▎  enter: pair  esc: cancel", m.pairAddr, m.input))
+		return statusStyle.Render(fmt.Sprintf("pairing code for %s: %s  enter: pair  esc: cancel", m.pairAddr, m.input.View()))
 	case modePairAddr:
-		return statusStyle.Render("device address (host:port): " + m.input + "▎  enter: next  esc: cancel")
+		return statusStyle.Render("device address (host:port): " + m.input.View() + "  enter: next  esc: cancel")
 	}
 	if m.pairErr != nil {
 		return errorStyle.Render("! " + m.pairErr.Error())
