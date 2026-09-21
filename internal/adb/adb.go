@@ -105,6 +105,66 @@ func parseDevices(out string) []Device {
 	return devices
 }
 
+// InstallOptions tunes a single `adb install`.
+type InstallOptions struct {
+	// Reinstall passes -r, keeping app data. This is the normal case in a
+	// dev loop; without it adb fails outright when the package is present.
+	Reinstall bool
+	// ExtraArgs are passed through verbatim before the apk path, e.g. -g to
+	// grant runtime permissions or -d to allow a downgrade.
+	ExtraArgs []string
+}
+
+// Install pushes apk to serial. It returns adb's combined output either way,
+// so the caller can show the real failure reason rather than "exit status 1".
+func (c *Client) Install(ctx context.Context, serial, apk string, opts InstallOptions) (string, error) {
+	args := []string{"-s", serial, "install"}
+	if opts.Reinstall {
+		args = append(args, "-r")
+	}
+	args = append(args, opts.ExtraArgs...)
+	args = append(args, apk)
+
+	cmd := exec.CommandContext(ctx, c.Binary, args...)
+	raw, err := cmd.CombinedOutput()
+	output := strings.TrimSpace(string(raw))
+	return output, installError(output, err)
+}
+
+// installError normalizes adb's two failure conventions. Older adb exits 0
+// and prints "Failure [INSTALL_FAILED_...]"; newer adb exits non-zero. Both
+// must be treated as failures, or a fleet install reports false success.
+func installError(output string, err error) error {
+	if failure := failureReason(output); failure != "" {
+		return fmt.Errorf("%s", failure)
+	}
+	if err != nil {
+		if output != "" {
+			return fmt.Errorf("%w: %s", err, lastLine(output))
+		}
+		return err
+	}
+	return nil
+}
+
+func failureReason(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Failure") || strings.HasPrefix(line, "Error:") {
+			return line
+		}
+		if strings.HasPrefix(line, "adb: failed to install") {
+			return strings.TrimPrefix(line, "adb: ")
+		}
+	}
+	return ""
+}
+
+func lastLine(output string) string {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
+}
+
 // Stream is a running `adb logcat` against one device.
 type Stream struct {
 	cmd    *exec.Cmd
