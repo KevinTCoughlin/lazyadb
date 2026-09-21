@@ -17,6 +17,7 @@ import (
 	"github.com/kevintcoughlin/lazyadb/internal/adb"
 	"github.com/kevintcoughlin/lazyadb/internal/fleet"
 	"github.com/kevintcoughlin/lazyadb/internal/known"
+	"github.com/kevintcoughlin/lazyadb/internal/logbuf"
 )
 
 const (
@@ -63,8 +64,14 @@ type Model struct {
 	// selected device.
 	allDevices bool
 
-	lines  []fleet.Line
+	logs   *logbuf.Buffer
 	paused bool
+	// logFocus sends the arrow/jk keys to the log instead of the device list.
+	logFocus bool
+	// logSel is the scroll cursor into the filtered view; negative follows
+	// the tail, which is the default and what you want while watching live.
+	logSel   int
+	minLevel byte
 
 	mode   mode
 	input  string
@@ -101,6 +108,8 @@ func New(ctx context.Context, f *fleet.Fleet, interval time.Duration, installOpt
 		installOpts: installOpts,
 		installJobs: installJobs,
 		store:       store,
+		logs:        logbuf.New(maxBufferedLines),
+		logSel:      -1,
 	}
 }
 
@@ -150,10 +159,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case lineMsg:
 		if !m.paused {
-			m.lines = append(m.lines, fleet.Line(msg))
-			if len(m.lines) > maxBufferedLines {
-				m.lines = m.lines[len(m.lines)-maxBufferedLines:]
-			}
+			m.logs.Append(fleet.Line(msg))
 		}
 		return m, waitForLine(m.fleet.Lines())
 
@@ -262,20 +268,60 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		m.quitting = true
 		return m, tea.Quit
+	case "tab":
+		m.logFocus = !m.logFocus
+		if !m.logFocus {
+			// Leaving the log resumes following the tail, so you never come
+			// back later to a view frozen somewhere in the past.
+			m.logSel = -1
+		}
 	case "j", "down":
+		if m.logFocus {
+			return m.scrollLog(1), nil
+		}
 		if m.selected < len(m.devices)-1 {
 			m.selected++
 		}
 	case "k", "up":
+		if m.logFocus {
+			return m.scrollLog(-1), nil
+		}
 		if m.selected > 0 {
 			m.selected--
 		}
+	case "ctrl+d", "pgdown":
+		if m.logFocus {
+			return m.scrollLog(10), nil
+		}
+	case "ctrl+u", "pgup":
+		if m.logFocus {
+			return m.scrollLog(-10), nil
+		}
+	case "g":
+		if m.logFocus {
+			m.logSel = 0
+		}
+	case "G":
+		if m.logFocus {
+			m.logSel = -1
+		}
+	case "enter":
+		// Fold or unfold the selected stack trace.
+		if m.logFocus {
+			entries := m.visibleEntries()
+			if sel := m.logSelection(len(entries)); sel >= 0 && entries[sel].IsTrace() {
+				entries[sel].Expanded = !entries[sel].Expanded
+			}
+		}
+	case "e":
+		m.minLevel = nextMinLevel(m.minLevel)
 	case "a":
 		m.allDevices = !m.allDevices
 	case "p", " ":
 		m.paused = !m.paused
 	case "c":
-		m.lines = nil
+		m.logs.Clear()
+		m.logSel = -1
 	case "r":
 		return m, m.refresh()
 	case "/":
@@ -308,6 +354,40 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.installErr = nil
 	}
 	return m, nil
+}
+
+// scrollLog moves the cursor by delta entries, clamping at the ends. Reaching
+// the bottom drops back into follow-the-tail rather than pinning to the last
+// entry, so live output keeps flowing.
+func (m Model) scrollLog(delta int) Model {
+	entries := m.visibleEntries()
+	if len(entries) == 0 {
+		return m
+	}
+
+	current := m.logSelection(len(entries))
+	next := current + delta
+	switch {
+	case next < 0:
+		next = 0
+	case next >= len(entries)-1:
+		m.logSel = -1
+		return m
+	}
+	m.logSel = next
+	return m
+}
+
+// nextMinLevel cycles all → warnings → errors → all. Those are the three
+// settings anyone actually uses when watching a fleet.
+func nextMinLevel(level byte) byte {
+	switch level {
+	case 0:
+		return 'W'
+	case 'W':
+		return 'E'
+	}
+	return 0
 }
 
 func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -576,42 +656,101 @@ func (m Model) logPanel(width, height int) string {
 		header += dimStyle.Render("  /" + m.filter)
 	}
 
-	visible := m.visibleLines()
+	if m.minLevel != 0 {
+		header += dimStyle.Render("  ≥" + string(m.minLevel))
+	}
+	if m.logFocus {
+		header += dimStyle.Render("  [scroll]")
+	}
+
+	entries := m.visibleEntries()
 	rows := height - 3
-	if len(visible) > rows {
-		visible = visible[len(visible)-rows:]
+
+	// Flatten entries to display rows, expanding any open traces. Windowing
+	// happens on rows so an expanded trace can't overflow the panel.
+	lines := make([]string, 0, rows+8)
+	marks := make([]bool, 0, rows+8)
+	for i, entry := range entries {
+		selected := m.logFocus && i == m.logSelection(len(entries))
+		lines = append(lines, m.renderEntry(entry, width-2, selected))
+		marks = append(marks, selected)
+		if entry.Expanded {
+			for _, frame := range entry.Frames {
+				lines = append(lines, dimStyle.Render("             "+truncate(frame, width-16)))
+				marks = append(marks, false)
+			}
+		}
+	}
+
+	start := 0
+	if len(lines) > rows {
+		start = len(lines) - rows
+		// When scrolled back, keep the selected entry on screen.
+		if m.logFocus {
+			for i, isSel := range marks {
+				if isSel && i < start {
+					start = i
+					break
+				}
+			}
+		}
+	}
+	end := start + rows
+	if end > len(lines) {
+		end = len(lines)
 	}
 
 	var b strings.Builder
 	b.WriteString(header)
 	b.WriteString("\n")
-	for _, line := range visible {
-		b.WriteString(m.renderLine(line, width-2))
+	for _, line := range lines[start:end] {
+		b.WriteString(line)
 		b.WriteString("\n")
 	}
 	return b.String()
 }
 
-func (m Model) visibleLines() []fleet.Line {
+// visibleEntries applies the device scope, text filter, and minimum level.
+func (m Model) visibleEntries() []*logbuf.Entry {
 	var serial string
 	if !m.allDevices && len(m.devices) > 0 {
 		serial = m.devices[m.selected].Serial
 	}
-	filter := strings.ToLower(m.filter)
+	return m.logs.View(logbuf.Filter{
+		Serial:   serial,
+		Text:     m.filter,
+		MinLevel: m.minLevel,
+	})
+}
 
-	out := make([]fleet.Line, 0, len(m.lines))
-	for _, line := range m.lines {
-		if serial != "" && line.Serial != serial {
-			continue
-		}
-		if filter != "" &&
-			!strings.Contains(strings.ToLower(line.Text), filter) &&
-			!strings.Contains(strings.ToLower(line.Tag), filter) {
-			continue
-		}
-		out = append(out, line)
+// logSelection resolves the scroll cursor. -1 means following the tail.
+func (m Model) logSelection(count int) int {
+	if count == 0 {
+		return -1
 	}
-	return out
+	if m.logSel < 0 || m.logSel >= count {
+		return count - 1
+	}
+	return m.logSel
+}
+
+func (m Model) renderEntry(entry *logbuf.Entry, width int, selected bool) string {
+	rendered := m.renderLine(entry.Line, width)
+	if entry.IsTrace() && !entry.Expanded {
+		label := "frames"
+		if len(entry.Frames) == 1 {
+			label = "frame"
+		}
+		rendered = truncateStyled(rendered, width-16) +
+			dimStyle.Render(fmt.Sprintf("  ▸ %d %s", len(entry.Frames), label))
+	}
+	if selected {
+		return selectedStyle.Render("▸") + rendered
+	}
+	if m.logFocus {
+		return " " + rendered
+	}
+	return rendered
 }
 
 func (m Model) renderLine(line fleet.Line, width int) string {
@@ -688,7 +827,10 @@ func (m Model) statusBar() string {
 	if dropped := m.fleet.Dropped(); dropped > 0 {
 		state += fmt.Sprintf("  %d dropped", dropped)
 	}
-	help := "j/k: device  a: fleet/one  i: install  /: filter  p: pause  c: clear  q: quit"
+	help := "tab: scroll log  j/k: device  a: fleet/one  e: level  i: install  /: filter  p: pause  q: quit"
+	if m.logFocus {
+		help = "j/k: scroll  ^u/^d: page  g/G: top/bottom  enter: fold  e: level  tab: devices  q: quit"
+	}
 	return statusStyle.Render(state + "  │  " + help)
 }
 
