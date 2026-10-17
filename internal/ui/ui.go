@@ -25,6 +25,8 @@ import (
 const (
 	devicePanelWidth = 30
 	maxBufferedLines = 5000
+	// wheelStep is how many log entries one mouse-wheel notch moves.
+	wheelStep = 3
 )
 
 var errNoTargets = errors.New("no online devices to install to")
@@ -235,6 +237,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 	}
 	return m, nil
 }
@@ -383,6 +388,37 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.installErr = nil
 	}
 	return m, nil
+}
+
+// handleMouse maps the wheel onto the same cursors the keyboard drives, so the
+// wheel never scrolls the viewport out from under the entry cursor and enter
+// always folds what is on screen. Mouse events only arrive with -mouse, since
+// mouse reporting costs plain drag-to-select in most terminals.
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.mode != modeNormal || m.pairPanel || msg.Action != tea.MouseActionPress {
+		return m, nil
+	}
+
+	var delta int
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		delta = -1
+	case tea.MouseButtonWheelDown:
+		delta = 1
+	default:
+		return m, nil
+	}
+
+	// The device panel is devicePanelWidth wide plus its two border columns.
+	if msg.X < devicePanelWidth+2 {
+		m.selected = min(max(m.selected+delta, 0), max(len(m.devices)-1, 0))
+		return m, nil
+	}
+
+	// Wheeling over the log focuses it, as tab does, so the cursor it moves
+	// is the one on screen.
+	m.logFocus = true
+	return m.scrollLog(delta * wheelStep).refreshLogView(), nil
 }
 
 // scrollLog moves the cursor by delta entries, clamping at the ends. Reaching
