@@ -46,6 +46,7 @@ func run() error {
 	installArgs := flag.String("install-args", "", "extra space-separated flags for adb install, e.g. \"-g -d\"")
 	jobs := flag.Int("jobs", 0, "max simultaneous installs; 0 means one per device")
 	knownPath := flag.String("known", "", "path to the known wireless devices file (default: user config dir)")
+	mouse := flag.Bool("mouse", false, "scroll with the mouse wheel; most terminals then need a modifier (often shift) to select text")
 	flag.Parse()
 
 	client := adb.New(*binary)
@@ -71,7 +72,11 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "lazyadb:", err)
 	}
 
-	program := tea.NewProgram(ui.New(ctx, f, *poll, opts, *jobs, store), tea.WithAltScreen())
+	programOpts := []tea.ProgramOption{tea.WithAltScreen()}
+	if *mouse {
+		programOpts = append(programOpts, tea.WithMouseCellMotion())
+	}
+	program := tea.NewProgram(ui.New(ctx, f, *poll, opts, *jobs, store), programOpts...)
 	if _, err := program.Run(); err != nil {
 		return err
 	}

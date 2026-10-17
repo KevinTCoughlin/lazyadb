@@ -24,14 +24,17 @@ Early. What works today:
   (`host:port`) targets are treated identically.
 - **Merged logcat** — one tail per online device, interleaved into a single
   stream with a per-device color-coded column, so you can watch the whole
-  fleet react to the same action at once.
+  fleet react to the same action at once. A device's first tail replays the
+  last 200 lines it holds; when it drops and comes back, the new tail starts
+  at the newest line, so a reconnect doesn't flood the view with its backlog.
 - **Stack traces survive merging** — a Java trace is many consecutive lines,
   and interleaving two devices' output shreds both of them. Frames are folded
   back onto the line that threw, per device, so a trace stays one collapsible
   entry no matter what else was arriving at the time. `enter` expands it.
 - **Scrollback** — `tab` moves the keyboard into the log: `j`/`k` to move,
   `^u`/`^d` to page, `g`/`G` for top and bottom. Reaching the bottom resumes
-  following the tail, so you never get stranded in the past.
+  following the tail, so you never get stranded in the past. With `-mouse`,
+  the wheel scrolls the log (or the device list, over that panel).
 - **Level filter** — `e` cycles all → warnings → errors.
 - **Scope toggle** — `a` flips between the whole fleet and just the selected
   device, without dropping the other tails.
@@ -76,7 +79,11 @@ goroutine dumps, which are a different format entirely.
 lazyadb                      # tail every attached device
 lazyadb -adb /opt/adb        # use a specific adb binary
 lazyadb -poll 5s             # re-scan for devices less aggressively
+lazyadb -mouse               # scroll with the mouse wheel
 ```
+
+`-mouse` is off by default because once a program takes the mouse, most
+terminals need a modifier (often `shift`) held to drag-select and copy text.
 
 | Key | Action |
 | --- | --- |
@@ -84,6 +91,7 @@ lazyadb -poll 5s             # re-scan for devices less aggressively
 | `a` | toggle between the whole fleet and the selected device |
 | `tab` | move the keyboard between the device list and the log |
 | `j`/`k`, `^u`/`^d`, `g`/`G` | scroll the log (when focused) |
+| mouse wheel | scroll the log or device list (with `-mouse`) |
 | `enter` | expand or fold the selected stack trace |
 | `e` | cycle minimum level: all → warnings → errors |
 | `w` | open the wireless pairing panel |
