@@ -7,6 +7,7 @@ package fleet
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,13 @@ type Line struct {
 	At     time.Time
 }
 
+// firstAttachBacklog is how many retained lines the first tail of a device
+// replays, so opening lazyadb isn't an empty screen. Later tails of the same
+// serial start at the newest line instead: wireless devices drop and return
+// routinely, and replaying the whole ring buffer on every return floods the
+// merged view and evicts the other devices' recent lines from the log buffer.
+const firstAttachBacklog = 200
+
 // Fleet owns one logcat tail per online device.
 type Fleet struct {
 	client *adb.Client
@@ -30,8 +38,18 @@ type Fleet struct {
 
 	mu      sync.Mutex
 	devices []adb.Device
-	tails   map[string]context.CancelFunc
-	dropped int
+	tails   map[string]*tailHandle
+	// attached holds every serial that has been tailed this session, so a
+	// reattach can be told apart from a first attach.
+	attached map[string]bool
+	dropped  int
+}
+
+// tailHandle identifies one running tail, so a tail that ends on its own can
+// remove itself from the map without clobbering a newer tail for the same
+// serial.
+type tailHandle struct {
+	cancel context.CancelFunc
 }
 
 // New returns a Fleet that buffers up to buffer merged lines.
@@ -40,9 +58,10 @@ func New(client *adb.Client, buffer int) *Fleet {
 		buffer = 1024
 	}
 	return &Fleet{
-		client: client,
-		lines:  make(chan Line, buffer),
-		tails:  make(map[string]context.CancelFunc),
+		client:   client,
+		lines:    make(chan Line, buffer),
+		tails:    make(map[string]*tailHandle),
+		attached: make(map[string]bool),
 	}
 }
 
@@ -83,17 +102,18 @@ func (f *Fleet) Refresh(ctx context.Context) ([]adb.Device, error) {
 
 	f.mu.Lock()
 	f.devices = found
-	for serial, cancel := range f.tails {
+	for serial, h := range f.tails {
 		if !online[serial] {
-			cancel()
+			h.cancel()
 			delete(f.tails, serial)
 		}
 	}
 	for serial := range online {
 		if _, tailing := f.tails[serial]; !tailing {
 			tailCtx, cancel := context.WithCancel(ctx)
-			f.tails[serial] = cancel
-			go f.tail(tailCtx, serial)
+			h := &tailHandle{cancel: cancel}
+			f.tails[serial] = h
+			go f.tail(tailCtx, h, serial, f.logcatArgs(serial))
 		}
 	}
 	f.mu.Unlock()
@@ -105,14 +125,36 @@ func (f *Fleet) Refresh(ctx context.Context) ([]adb.Device, error) {
 func (f *Fleet) Close() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for serial, cancel := range f.tails {
-		cancel()
+	for serial, h := range f.tails {
+		h.cancel()
 		delete(f.tails, serial)
 	}
 }
 
-func (f *Fleet) tail(ctx context.Context, serial string) {
-	stream, err := f.client.Logcat(ctx, serial)
+// logcatArgs picks where a new tail of serial starts. f.mu must be held.
+func (f *Fleet) logcatArgs(serial string) []string {
+	if f.attached[serial] {
+		return []string{"-T", "1"}
+	}
+	f.attached[serial] = true
+	return []string{"-T", strconv.Itoa(firstAttachBacklog)}
+}
+
+func (f *Fleet) tail(ctx context.Context, h *tailHandle, serial string, args []string) {
+	// adb's logcat exits when the device drops. If the device is back before
+	// the next Refresh notices it was gone, Refresh still sees this tail in
+	// the map and would never start another, so a tail that ends for any
+	// reason removes itself and the next Refresh reattaches.
+	defer func() {
+		h.cancel()
+		f.mu.Lock()
+		if f.tails[serial] == h {
+			delete(f.tails, serial)
+		}
+		f.mu.Unlock()
+	}()
+
+	stream, err := f.client.Logcat(ctx, serial, args...)
 	if err != nil {
 		f.emit(Line{Serial: serial, Level: 'E', Tag: "lazyadb", Text: err.Error(), At: time.Now()})
 		return
