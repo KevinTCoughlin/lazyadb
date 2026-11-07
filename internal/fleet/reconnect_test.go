@@ -160,3 +160,25 @@ func TestReconnectEmpty(t *testing.T) {
 		t.Errorf("Reconnect(nil) = %+v, want nil", got)
 	}
 }
+
+// ConnectStored is for a device the caller knows isn't advertising, so it
+// must use the saved address as-is and never follow mDNS elsewhere.
+func TestConnectStoredUsesSavedAddress(t *testing.T) {
+	f := New(adb.New(fakePairADB(t, reconnectScript)), 8)
+
+	// reconnectScript advertises DEV1 on :51999 and refuses anything else,
+	// so connecting to the saved :42137 must fail rather than silently
+	// following mDNS.
+	r := f.ConnectStored(context.Background(), known.Device{DeviceID: "DEV1", Addr: "10.0.0.5:42137"})
+	if r.Connected || r.Err == nil {
+		t.Fatalf("expected the stale saved address to fail, got %+v", r)
+	}
+	if r.Addr != "10.0.0.5:42137" || r.Rediscovered {
+		t.Errorf("Addr = %q, Rediscovered = %v; want the saved address, not rediscovered", r.Addr, r.Rediscovered)
+	}
+
+	r = f.ConnectStored(context.Background(), known.Device{DeviceID: "DEV1", Addr: "10.0.0.5:51999"})
+	if !r.Connected {
+		t.Fatalf("Connected = false, err = %v", r.Err)
+	}
+}

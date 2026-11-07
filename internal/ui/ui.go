@@ -205,10 +205,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pairErr = msg.err
 		}
 		m.services = msg.services
-		if m.pairSelected >= len(m.services) {
-			m.pairSelected = max(0, len(m.services)-1)
+		return m.clampPairSelection(), nil
+
+	case knownConnectMsg:
+		m.pairBusy = false
+		r := msg.result
+		if r.Connected {
+			m.pairErr = nil
+			m.pairResult = &fleet.PairResult{ConnectAddr: r.Addr, DeviceID: r.Device.DeviceID, Connected: true}
+			m.persistReconnects([]fleet.ReconnectResult{r})
+		} else {
+			m.pairErr = fmt.Errorf("connect %s: %w", r.Addr, r.Err)
 		}
-		return m, nil
+		return m, tea.Batch(m.refresh(), m.discover())
+
+	case forgetMsg:
+		m.pairErr = msg.err
+		return m.clampPairSelection(), nil
 
 	case discoverTickMsg:
 		// Only keep sweeping while the panel is actually open.
@@ -518,7 +531,8 @@ func (m Model) closePrompt() Model {
 //
 // This matters precisely when mDNS is unavailable: the stored address is the
 // only fallback then, so leaving a known-stale one on disk defeats the point
-// of storing it at all. It also refreshes LastConnected, which orders the list.
+// of storing it at all. It also refreshes LastConnected, which orders the list
+// and is shown as "last seen" for devices that are not advertising.
 func (m Model) persistReconnects(results []fleet.ReconnectResult) {
 	if m.store == nil {
 		return
@@ -527,9 +541,8 @@ func (m Model) persistReconnects(results []fleet.ReconnectResult) {
 		if !r.Connected || r.Addr == "" {
 			continue
 		}
-		if !r.Rediscovered && r.Addr == r.Device.Addr && !r.Device.LastConnected.IsZero() {
-			continue
-		}
+		// Written even when the address is unchanged: LastConnected is what
+		// the pairing panel shows as "last seen", and it must not lag.
 		_ = m.fleet.RememberConnected(m.store, r.Device.DeviceID, r.Addr, r.Device.Label)
 	}
 }

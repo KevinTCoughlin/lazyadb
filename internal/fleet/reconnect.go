@@ -57,6 +57,14 @@ func (f *Fleet) Reconnect(ctx context.Context, devices []known.Device) []Reconne
 	return results
 }
 
+// ConnectStored attaches to one known device at its saved address without
+// consulting mDNS. It is exactly Reconnect's fallback path, for when the
+// caller already knows the device is not advertising — the pairing panel's
+// "Known, not advertising" rows — so a sweep would only cost time.
+func (f *Fleet) ConnectStored(ctx context.Context, device known.Device) ReconnectResult {
+	return f.reconnectOne(ctx, device, nil, f.attachedAddrs(ctx))
+}
+
 func (f *Fleet) reconnectOne(ctx context.Context, device known.Device, services []adb.MDNSService, attached map[string]bool) ReconnectResult {
 	result := ReconnectResult{Device: device, Addr: device.Addr}
 

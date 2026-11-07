@@ -53,6 +53,11 @@ Early. What works today:
   that has usually gone stale. The saved address is kept as the fallback for
   when mDNS is unavailable, and is rewritten whenever a device turns up
   somewhere new.
+- **Known devices stay visible** — the pairing panel lists remembered devices
+  that are not advertising (asleep, on another network, or behind wifi that
+  drops mDNS) under "Known, not advertising", with when each was last seen.
+  `enter` tries the saved address directly and `d` forgets the device. A
+  device that *is* advertising is listed once, under its live address.
 - **Parallel install** — `i` installs an APK to every online device at once,
   with per-device results. One device failing never aborts the others.
 

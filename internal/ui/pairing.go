@@ -10,6 +10,7 @@ import (
 
 	"github.com/kevintcoughlin/lazyadb/internal/adb"
 	"github.com/kevintcoughlin/lazyadb/internal/fleet"
+	"github.com/kevintcoughlin/lazyadb/internal/known"
 )
 
 // connectWait bounds how long we wait for a freshly paired device to start
@@ -56,6 +57,117 @@ type pairDoneMsg struct {
 	err    error
 }
 
+// knownConnectMsg is the outcome of enter on a "Known, not advertising" row.
+type knownConnectMsg struct {
+	result fleet.ReconnectResult
+}
+
+// forgetMsg is the outcome of d on a "Known, not advertising" row.
+type forgetMsg struct {
+	err error
+}
+
+// pairRowKind is which group a pairing-panel row belongs to.
+type pairRowKind int
+
+const (
+	rowPairable pairRowKind = iota
+	rowConnectable
+	rowKnown
+)
+
+func (k pairRowKind) String() string {
+	switch k {
+	case rowPairable:
+		return "Waiting to pair"
+	case rowConnectable:
+		return "Ready to connect"
+	}
+	return "Known, not advertising"
+}
+
+// pairRow is one selectable line in the pairing panel: either a live mDNS
+// advertisement or a remembered device that is not currently advertising.
+type pairRow struct {
+	kind    pairRowKind
+	service adb.MDNSService // rowPairable, rowConnectable
+	device  known.Device    // rowKnown
+}
+
+// pairRows merges what mDNS is advertising right now with the devices we have
+// paired before, grouped in display order.
+//
+// Devices are keyed by mDNS device ID, the only identity that survives a port
+// change. A known device that is advertising under that ID is listed once, as
+// its live row, because the live row carries the current port. An exact
+// address match also counts as advertising: some adb builds rotate the mDNS
+// instance name after pairing, and the same host:port is the same endpoint
+// whatever it is called.
+func pairRows(services []adb.MDNSService, devices []known.Device) []pairRow {
+	advertisingIDs := make(map[string]bool, len(services))
+	advertisingAddrs := make(map[string]bool, len(services))
+	var pairable, connectable []pairRow
+	for _, svc := range services {
+		advertisingIDs[svc.DeviceID()] = true
+		advertisingAddrs[svc.Addr] = true
+		switch {
+		case svc.Pairable():
+			pairable = append(pairable, pairRow{kind: rowPairable, service: svc})
+		case svc.Connectable():
+			connectable = append(connectable, pairRow{kind: rowConnectable, service: svc})
+		}
+	}
+
+	rows := make([]pairRow, 0, len(pairable)+len(connectable)+len(devices))
+	rows = append(rows, pairable...)
+	rows = append(rows, connectable...)
+	for _, d := range devices {
+		if advertisingIDs[d.DeviceID] || (d.Addr != "" && advertisingAddrs[d.Addr]) {
+			continue
+		}
+		rows = append(rows, pairRow{kind: rowKnown, device: d})
+	}
+	return rows
+}
+
+// knownDevices is the remembered set, or nil without a store.
+func (m Model) knownDevices() []known.Device {
+	if m.store == nil {
+		return nil
+	}
+	return m.store.List()
+}
+
+func (m Model) pairRows() []pairRow { return pairRows(m.services, m.knownDevices()) }
+
+// clampPairSelection keeps the cursor on a row after the list shrinks.
+func (m Model) clampPairSelection() Model {
+	if n := len(m.pairRows()); m.pairSelected >= n {
+		m.pairSelected = max(0, n-1)
+	}
+	return m
+}
+
+// relativeTime renders how long ago t was, coarsely: this is for "is this the
+// phone I used this morning or last month", not for timing anything.
+func relativeTime(now, t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	d := now.Sub(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d/time.Minute))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d/time.Hour))
+	case d < 30*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d/(24*time.Hour)))
+	}
+	return t.Format("2006-01-02")
+}
+
 func (m Model) discover() tea.Cmd {
 	return func() tea.Msg {
 		services, err := m.fleet.Discover(m.ctx)
@@ -77,6 +189,27 @@ func (m Model) connect(addr string) tea.Cmd {
 			result: fleet.PairResult{ConnectAddr: addr, Connected: err == nil, Output: out},
 			err:    err,
 		}
+	}
+}
+
+// connectKnown tries a remembered device at its saved address. It is
+// fleet.Reconnect's fallback path: the row exists because mDNS is silent about
+// this device, so there is nothing to rediscover.
+func (m Model) connectKnown(device known.Device) tea.Cmd {
+	return func() tea.Msg {
+		return knownConnectMsg{result: m.fleet.ConnectStored(m.ctx, device)}
+	}
+}
+
+// forget drops a remembered device. There is no connection to tear down: the
+// row only exists because the device is not advertising.
+func (m Model) forget(device known.Device) tea.Cmd {
+	store := m.store
+	return func() tea.Msg {
+		if store == nil {
+			return forgetMsg{}
+		}
+		return forgetMsg{err: store.Forget(device.DeviceID)}
 	}
 }
 
@@ -106,7 +239,7 @@ func (m Model) handlePairKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.pairResult = nil
 		return m, nil
 	case "j", "down":
-		if m.pairSelected < len(m.services)-1 {
+		if m.pairSelected < len(m.pairRows())-1 {
 			m.pairSelected++
 		}
 	case "k", "up":
@@ -119,40 +252,48 @@ func (m Model) handlePairKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "d":
 		// Disconnect and forget. Pairing itself lives on the device, so this
 		// only drops the connection and our memory of it.
-		svc, ok := m.selectedService()
-		if !ok || !svc.Connectable() {
+		row, ok := m.selectedRow()
+		if !ok || row.kind == rowPairable {
 			return m, nil
 		}
 		m.pairErr = nil
 		m.pairResult = nil
-		return m, m.disconnect(svc)
+		if row.kind == rowKnown {
+			return m, m.forget(row.device)
+		}
+		return m, m.disconnect(row.service)
 	case "m":
 		// mDNS is unreliable across VLANs and locked-down corporate wifi, so
 		// typing the address off the device's screen has to stay possible.
 		m = m.openPrompt(modePairAddr)
 		m.pairErr = nil
 	case "enter":
-		svc, ok := m.selectedService()
+		row, ok := m.selectedRow()
 		if !ok {
 			return m, nil
 		}
 		m.pairErr = nil
 		m.pairResult = nil
-		if svc.Connectable() {
+		switch row.kind {
+		case rowConnectable:
 			m.pairBusy = true
-			return m, m.connect(svc.Addr)
+			return m, m.connect(row.service.Addr)
+		case rowKnown:
+			m.pairBusy = true
+			return m, m.connectKnown(row.device)
 		}
-		m.pairAddr = svc.Addr
+		m.pairAddr = row.service.Addr
 		m = m.openPrompt(modePairCode)
 	}
 	return m, nil
 }
 
-func (m Model) selectedService() (adb.MDNSService, bool) {
-	if m.pairSelected < 0 || m.pairSelected >= len(m.services) {
-		return adb.MDNSService{}, false
+func (m Model) selectedRow() (pairRow, bool) {
+	rows := m.pairRows()
+	if m.pairSelected < 0 || m.pairSelected >= len(rows) {
+		return pairRow{}, false
 	}
-	return m.services[m.pairSelected], true
+	return rows[m.pairSelected], true
 }
 
 func (m Model) pairPanelView(width, height int) string {
@@ -170,16 +311,29 @@ func (m Model) pairPanelView(width, height int) string {
 		b.WriteString("\n\n")
 	}
 
-	if len(m.services) == 0 {
-		b.WriteString(dimStyle.Render("no devices discovered over mDNS"))
+	rows := m.pairRows()
+	switch {
+	case len(rows) == 0:
+		// Nothing advertising and nothing remembered: this is a first run,
+		// so say how to get a device into pairing mode.
+		b.WriteString(dimStyle.Render("no devices discovered over mDNS, and nothing paired yet"))
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("On the device: Developer options → Wireless debugging"))
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render("→ Pair device with pairing code, then press r to rescan"))
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render("or m to type the address shown on screen."))
-	} else {
-		b.WriteString(m.serviceList(width, height))
+	case len(m.services) == 0:
+		// Paired before, but nothing is advertising. Say so explicitly, or
+		// this reads as a broken discovery rather than absent devices.
+		b.WriteString(dimStyle.Render(fmt.Sprintf(
+			"no devices discovered over mDNS; none of %d known device(s) is advertising", len(rows))))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("They may be asleep, on another network, or behind wifi that blocks mDNS."))
+		b.WriteString("\n\n")
+		b.WriteString(m.pairRowList(rows, width, height-3))
+	default:
+		b.WriteString(m.pairRowList(rows, width, height))
 	}
 
 	if m.pairResult != nil {
@@ -189,39 +343,69 @@ func (m Model) pairPanelView(width, height int) string {
 	return b.String()
 }
 
-func (m Model) serviceList(width, height int) string {
+func (m Model) pairRowList(rows []pairRow, width, height int) string {
 	var b strings.Builder
-	var lastGroup string
+	lastGroup := pairRowKind(-1)
+	now := time.Now()
 
-	rows := height - 6
-	for i, svc := range m.services {
-		if i >= rows {
-			b.WriteString(dimStyle.Render(fmt.Sprintf("… %d more", len(m.services)-i)))
+	limit := height - 6
+	for i, row := range rows {
+		if i >= limit {
+			b.WriteString(dimStyle.Render(fmt.Sprintf("… %d more", len(rows)-i)))
 			break
 		}
 
-		group := "Ready to connect"
-		if svc.Pairable() {
-			group = "Waiting to pair"
-		}
-		if group != lastGroup {
-			if lastGroup != "" {
+		if row.kind != lastGroup {
+			if lastGroup != -1 {
 				b.WriteString("\n")
 			}
-			b.WriteString(dimStyle.Render(group))
+			b.WriteString(dimStyle.Render(row.kind.String()))
 			b.WriteString("\n")
-			lastGroup = group
+			lastGroup = row.kind
 		}
 
 		marker, style := "  ", lipgloss.NewStyle()
 		if i == m.pairSelected {
 			marker, style = "▸ ", selectedStyle
 		}
-		line := fmt.Sprintf("%-22s %s", svc.Addr, svc.DeviceID())
-		b.WriteString(style.Render(marker + truncate(line, width-6)))
+		b.WriteString(style.Render(marker + truncate(m.pairRowText(row, now), width-6)))
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+func (m Model) pairRowText(row pairRow, now time.Time) string {
+	if row.kind != rowKnown {
+		return fmt.Sprintf("%-22s %s", row.service.Addr, row.service.DeviceID())
+	}
+	d := row.device
+	label := d.Label
+	if label == "" {
+		label = d.DeviceID
+	}
+	addr := d.Addr
+	if addr == "" {
+		addr = "(no saved address)"
+	}
+	// A device reattached at startup through its saved address is in the
+	// fleet even though mDNS can't see it; "last seen" would undersell that.
+	seen := "last seen " + relativeTime(now, d.LastConnected)
+	if m.isAttached(d.Addr) {
+		seen = "attached"
+	}
+	return fmt.Sprintf("%-22s %-16s %s", addr, label, seen)
+}
+
+func (m Model) isAttached(serial string) bool {
+	if serial == "" {
+		return false
+	}
+	for _, d := range m.devices {
+		if d.Serial == serial && d.Online() {
+			return true
+		}
+	}
+	return false
 }
 
 // reconnectSummary reports what startup reconnection did. Rediscovered
@@ -281,5 +465,5 @@ func (m Model) pairStatusBar() string {
 	if m.pairBusy {
 		return statusStyle.Render("pairing…")
 	}
-	return statusStyle.Render("j/k: select  enter: pair/connect  d: disconnect  m: manual  r: rescan  w/esc: close  q: quit")
+	return statusStyle.Render("j/k: select  enter: pair/connect  d: disconnect/forget  m: manual  r: rescan  w/esc: close  q: quit")
 }
