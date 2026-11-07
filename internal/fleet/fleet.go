@@ -20,8 +20,12 @@ type Line struct {
 	Serial string
 	Level  byte // V, D, I, W, E, F, or 0 when unparsed
 	Tag    string
-	Text   string
-	At     time.Time
+	// PID is the process that logged the line, or 0 when the line carried
+	// none. It is the device's PID: the same number on two devices is two
+	// unrelated processes.
+	PID  int
+	Text string
+	At   time.Time
 }
 
 // firstAttachBacklog is how many retained lines the first tail of a device
@@ -182,7 +186,8 @@ func (f *Fleet) emit(line Line) {
 }
 
 // parseLine understands logcat's "brief" format: "I/Tag( 1234): message".
-// Anything that doesn't match is kept verbatim rather than dropped.
+// logcat pads the PID to five columns, hence the space. Anything that doesn't
+// match is kept verbatim rather than dropped.
 func parseLine(serial, raw string) Line {
 	line := Line{Serial: serial, Text: raw, At: time.Now()}
 	if len(raw) < 2 || raw[1] != '/' {
@@ -199,9 +204,16 @@ func parseLine(serial, raw string) Line {
 	if !ok {
 		return line
 	}
-	tag, _, ok := strings.Cut(head, "(")
-	if !ok {
-		tag = head
+	tag := head
+	// The PID group is the last parenthesised part, so a tag that itself
+	// contains "(" still splits correctly.
+	if open := strings.LastIndexByte(head, '('); open != -1 {
+		tag = head[:open]
+		if pid, ok := strings.CutSuffix(head[open+1:], ")"); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(pid)); err == nil && n > 0 {
+				line.PID = n
+			}
+		}
 	}
 	line.Tag = strings.TrimSpace(tag)
 	line.Text = msg

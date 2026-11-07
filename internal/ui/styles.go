@@ -22,6 +22,8 @@ var (
 
 	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Padding(0, 1)
 
+	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("215"))
+
 	// deviceColors give each device in the fleet a stable, distinguishable
 	// color in the merged log's device column.
 	deviceColors = []lipgloss.Color{"117", "150", "215", "183", "210", "229", "152", "180"}
@@ -35,6 +37,9 @@ var (
 		'F': "197",
 	}
 )
+
+// mutedMarker follows a muted device's name in the device panel.
+const mutedMarker = " [muted]"
 
 func deviceStyle(index int) lipgloss.Style {
 	color := deviceColors[index%len(deviceColors)]

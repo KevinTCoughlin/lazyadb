@@ -201,3 +201,116 @@ func TestClear(t *testing.T) {
 		t.Error("frame attached to a cleared entry")
 	}
 }
+
+func pidLine(serial string, pid int, text string) fleet.Line {
+	return fleet.Line{Serial: serial, Level: 'I', Tag: "T", PID: pid, Text: text}
+}
+
+func TestPIDFilter(t *testing.T) {
+	b := New(100)
+	b.Append(pidLine("A", 3121, "from the app"))
+	b.Append(pidLine("A", 914, "from system_server"))
+	b.Append(pidLine("A", 3150, "from the app's :remote process"))
+	b.Append(line("A", 0, "", "--------- beginning of main"))
+
+	got := b.View(Filter{PIDs: []int{3121}})
+	if len(got) != 1 || got[0].Line.Text != "from the app" {
+		t.Errorf("pid 3121 = %+v, want only the app's line", got)
+	}
+
+	got = b.View(Filter{PIDs: []int{3121, 3150}})
+	if len(got) != 2 {
+		t.Errorf("pids 3121,3150 matched %d entries, want 2", len(got))
+	}
+
+	// PID combines with text rather than replacing it.
+	got = b.View(Filter{PIDs: []int{3121, 3150}, Text: "remote"})
+	if len(got) != 1 || got[0].Line.PID != 3150 {
+		t.Errorf("pid + text = %+v, want the :remote line", got)
+	}
+
+	if got := b.View(Filter{}); len(got) != 4 {
+		t.Errorf("no PID filter kept %d entries, want 4 (including the pid-less line)", len(got))
+	}
+}
+
+func TestParseQuery(t *testing.T) {
+	tests := []struct {
+		query string
+		text  string
+		pids  []int
+	}{
+		{"", "", nil},
+		{"  NullPointer  ", "NullPointer", nil},
+		{"two  spaces", "two  spaces", nil},
+		{"pid:3121", "", []int{3121}},
+		{"PID:3121 crash", "crash", []int{3121}},
+		{"okhttp pid:3121 pid:3150 GET", "okhttp GET", []int{3121, 3150}},
+		{"pid:abc", "pid:abc", nil},
+		{"pid:0", "pid:0", nil},
+		{"pid:", "pid:", nil},
+	}
+	for _, tt := range tests {
+		got := ParseQuery(tt.query)
+		if got.Text != tt.text {
+			t.Errorf("ParseQuery(%q).Text = %q, want %q", tt.query, got.Text, tt.text)
+		}
+		if len(got.PIDs) != len(tt.pids) {
+			t.Errorf("ParseQuery(%q).PIDs = %v, want %v", tt.query, got.PIDs, tt.pids)
+			continue
+		}
+		for i := range tt.pids {
+			if got.PIDs[i] != tt.pids[i] {
+				t.Errorf("ParseQuery(%q).PIDs = %v, want %v", tt.query, got.PIDs, tt.pids)
+			}
+		}
+	}
+}
+
+func TestMutedDeviceLinesAreDropped(t *testing.T) {
+	b := New(100)
+	b.SetMuted("noisy", true)
+
+	b.Append(line("noisy", 'I', "Spam", "spam 1"))
+	b.Append(line("quiet", 'I', "App", "useful"))
+	b.Append(line("noisy", 'I', "Spam", "spam 2"))
+
+	got := b.View(Filter{})
+	if len(got) != 1 || got[0].Line.Serial != "quiet" {
+		t.Fatalf("entries = %+v, want only the unmuted device's line", got)
+	}
+	if !b.Muted("noisy") || b.Muted("quiet") {
+		t.Error("Muted() does not reflect SetMuted")
+	}
+
+	// Unmuting resumes from now on; what arrived while muted is gone.
+	b.SetMuted("noisy", false)
+	b.Append(line("noisy", 'I', "Spam", "spam 3"))
+	if got := b.View(Filter{Serial: "noisy"}); len(got) != 1 || got[0].Line.Text != "spam 3" {
+		t.Errorf("after unmute = %+v, want only the line logged after unmuting", got)
+	}
+}
+
+// Frames that arrive after an unmute must not fold onto a trace from before
+// the mute: the lines in between were dropped.
+func TestUnmuteDoesNotFoldOntoPreMuteTrace(t *testing.T) {
+	b := New(100)
+	b.Append(line("A", 'E', "AndroidRuntime", "FATAL EXCEPTION: main"))
+	b.SetMuted("A", true)
+	b.SetMuted("A", false)
+	b.Append(line("A", 'E', "AndroidRuntime", "\tat com.a.Foo.run(Foo.java:1)"))
+
+	if got := b.Len(); got != 2 {
+		t.Errorf("Len() = %d, want 2: a post-unmute frame is a new record", got)
+	}
+}
+
+func TestMuteSurvivesClear(t *testing.T) {
+	b := New(100)
+	b.SetMuted("A", true)
+	b.Clear()
+	b.Append(line("A", 'I', "T", "x"))
+	if b.Len() != 0 {
+		t.Error("Clear() unmuted the device")
+	}
+}

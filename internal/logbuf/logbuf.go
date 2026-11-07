@@ -10,6 +10,8 @@
 package logbuf
 
 import (
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/kevintcoughlin/lazyadb/internal/fleet"
@@ -37,6 +39,10 @@ type Buffer struct {
 	// last is the most recent entry per device, so a continuation can find
 	// the line it belongs to even when other devices logged in between.
 	last map[string]*Entry
+	// muted devices have their lines dropped on arrival. Dropped, not held
+	// back: muting means "I don't care about this right now", and revealing a
+	// backlog on unmute would flood the view and need its own eviction rules.
+	muted map[string]bool
 }
 
 // New returns a Buffer holding at most max entries.
@@ -44,13 +50,31 @@ func New(max int) *Buffer {
 	if max <= 0 {
 		max = 1000
 	}
-	return &Buffer{max: max, last: make(map[string]*Entry)}
+	return &Buffer{max: max, last: make(map[string]*Entry), muted: make(map[string]bool)}
 }
+
+// SetMuted mutes or unmutes one device. The device's tail keeps running; the
+// buffer just stops accepting its lines.
+func (b *Buffer) SetMuted(serial string, muted bool) {
+	if !muted {
+		delete(b.muted, serial)
+		return
+	}
+	b.muted[serial] = true
+	// Whatever the device logs after unmuting must not be folded onto an
+	// entry from before the mute: the frames in between were dropped, so
+	// they would join two unrelated records.
+	delete(b.last, serial)
+}
+
+// Muted reports whether a device's lines are being dropped.
+func (b *Buffer) Muted(serial string) bool { return b.muted[serial] }
 
 // Len is the number of entries held.
 func (b *Buffer) Len() int { return len(b.entries) }
 
-// Clear drops everything.
+// Clear drops every entry. Mutes are a view preference, not content, and
+// survive it.
 func (b *Buffer) Clear() {
 	b.entries = nil
 	b.last = make(map[string]*Entry)
@@ -59,6 +83,9 @@ func (b *Buffer) Clear() {
 // Append adds a line, folding it into the preceding entry when it is a
 // continuation of that device's trace.
 func (b *Buffer) Append(line fleet.Line) {
+	if b.muted[line.Serial] {
+		return
+	}
 	if prev, ok := b.last[line.Serial]; ok && isContinuation(prev, line) {
 		prev.Frames = append(prev.Frames, strings.TrimSpace(line.Text))
 		return
@@ -148,6 +175,35 @@ type Filter struct {
 	Text string
 	// MinLevel hides anything less severe. Zero keeps everything.
 	MinLevel byte
+	// PIDs limits to lines logged by any of these processes; empty keeps
+	// every process. A PID is only meaningful per device, so across the
+	// whole fleet this can also match unrelated processes elsewhere.
+	PIDs []int
+}
+
+// ParseQuery splits what was typed at the filter prompt into the text
+// substring and any "pid:N" tokens, which may repeat (an app with a
+// ":remote" process has two). A token that is not a valid pid, such as
+// "pid:abc", is kept as ordinary text. When pid tokens are present the
+// remaining words are rejoined with single spaces.
+func ParseQuery(query string) Filter {
+	var f Filter
+	var words []string
+	for _, word := range strings.Fields(query) {
+		if rest, ok := strings.CutPrefix(strings.ToLower(word), "pid:"); ok {
+			if pid, err := strconv.Atoi(rest); err == nil && pid > 0 {
+				f.PIDs = append(f.PIDs, pid)
+				continue
+			}
+		}
+		words = append(words, word)
+	}
+	if len(f.PIDs) == 0 {
+		f.Text = strings.TrimSpace(query)
+		return f
+	}
+	f.Text = strings.Join(words, " ")
+	return f
 }
 
 // Matches reports whether an entry survives the filter.
@@ -156,6 +212,9 @@ func (f Filter) Matches(e *Entry) bool {
 		return false
 	}
 	if f.MinLevel != 0 && levelRank(e.Line.Level) < levelRank(f.MinLevel) {
+		return false
+	}
+	if len(f.PIDs) > 0 && !slices.Contains(f.PIDs, e.Line.PID) {
 		return false
 	}
 	if f.Text == "" {

@@ -364,7 +364,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "a":
 		m.allDevices = !m.allDevices
 		return m.refreshLogView(), nil
-	case "p", " ":
+	case "p":
+		// In the device panel p mutes the selected device; global pause is a
+		// log-panel action (and space works from anywhere).
+		if m.logFocus || len(m.devices) == 0 {
+			m.paused = !m.paused
+			return m, nil
+		}
+		serial := m.devices[m.selected].Serial
+		m.logs.SetMuted(serial, !m.logs.Muted(serial))
+	case " ":
 		m.paused = !m.paused
 	case "c":
 		m.logs.Clear()
@@ -659,8 +668,12 @@ func (m Model) devicePanel(height int) string {
 			marker = "▸ "
 			style = selectedStyle
 		}
-		name := truncate(d.Label(), devicePanelWidth-6)
-		b.WriteString(style.Render(marker + name))
+		if m.logs.Muted(d.Serial) {
+			name := truncate(d.Label(), devicePanelWidth-6-len(mutedMarker))
+			b.WriteString(style.Render(marker+name) + mutedStyle.Render(mutedMarker))
+		} else {
+			b.WriteString(style.Render(marker + truncate(d.Label(), devicePanelWidth-6)))
+		}
 		b.WriteString("\n")
 
 		// The second line is the device's serial normally, and its install
@@ -823,11 +836,10 @@ func (m Model) visibleEntries() []*logbuf.Entry {
 	if !m.allDevices && len(m.devices) > 0 {
 		serial = m.devices[m.selected].Serial
 	}
-	return m.logs.View(logbuf.Filter{
-		Serial:   serial,
-		Text:     m.filter,
-		MinLevel: m.minLevel,
-	})
+	filter := logbuf.ParseQuery(m.filter)
+	filter.Serial = serial
+	filter.MinLevel = m.minLevel
+	return m.logs.View(filter)
 }
 
 // logSelection resolves the scroll cursor. -1 means following the tail.
@@ -869,7 +881,13 @@ func (m Model) renderLine(line fleet.Line, width int) string {
 
 	text := line.Text
 	if line.Tag != "" {
-		text = dimStyle.Render(line.Tag+": ") + text
+		// The PID is shown, as logcat does, because a pid: filter is no use
+		// if you can't see which number to filter on.
+		tag := line.Tag
+		if line.PID > 0 {
+			tag += fmt.Sprintf("(%d)", line.PID)
+		}
+		text = dimStyle.Render(tag+": ") + text
 	}
 	rendered := col + " " + level + " " + text
 	return truncateStyled(rendered, width)
@@ -896,7 +914,7 @@ func (m Model) indexOf(serial string) int {
 func (m Model) statusBar() string {
 	switch m.mode {
 	case modeFilter:
-		return statusStyle.Render("/" + m.input.View() + "  enter: apply  esc: clear")
+		return statusStyle.Render("/" + m.input.View() + "  pid:N for a process  enter: apply  esc: clear")
 	case modeInstallPrompt:
 		scope := fmt.Sprintf("%d device(s)", len(m.installTargets()))
 		return statusStyle.Render("install apk → " + scope + ": " + m.input.View() + "  enter: run  esc: cancel")
@@ -934,9 +952,9 @@ func (m Model) statusBar() string {
 	if dropped := m.fleet.Dropped(); dropped > 0 {
 		state += fmt.Sprintf("  %d dropped", dropped)
 	}
-	help := "tab: scroll log  j/k: device  a: fleet/one  e: level  i: install  /: filter  p: pause  q: quit"
+	help := "tab: scroll log  j/k: device  p: mute device  a: fleet/one  e: level  i: install  /: filter  space: pause  q: quit"
 	if m.logFocus {
-		help = "j/k: scroll  ^u/^d: page  g/G: top/bottom  enter: fold  e: level  tab: devices  q: quit"
+		help = "j/k: scroll  ^u/^d: page  g/G: top/bottom  enter: fold  e: level  p: pause  tab: devices  q: quit"
 	}
 	return statusStyle.Render(state + "  │  " + help)
 }

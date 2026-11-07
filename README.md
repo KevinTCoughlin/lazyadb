@@ -39,7 +39,14 @@ Early. What works today:
 - **Scope toggle** — `a` flips between the whole fleet and just the selected
   device, without dropping the other tails.
 - **Filter, pause, clear** — substring filter across message and tag, pause to
-  read, clear to reset.
+  read, clear to reset. Add `pid:3121` to the filter to keep one process's
+  lines (repeat it for an app with several processes); each line's tag shows
+  its PID, as logcat does. PIDs are per device, so pair it with `a` to scope
+  to one device.
+- **Per-device mute** — `p` on a device in the device panel mutes it: its tail
+  keeps running but its lines are dropped (not held back for later) until you
+  press `p` again, and the panel marks it `[muted]`. For when one device is
+  drowning out the rest.
 - **Wireless pairing** — `w` opens a pairing panel that discovers devices over
   mDNS, takes the pairing code, and then *finds the connect port itself*. The
   port a device shows you for pairing is not the port you connect on, so by
@@ -99,10 +106,11 @@ terminals need a modifier (often `shift`) held to drag-select and copy text.
 | mouse wheel | scroll the log or device list (with `-mouse`) |
 | `enter` | expand or fold the selected stack trace |
 | `e` | cycle minimum level: all → warnings → errors |
-| `w` | open the wireless pairing panel |
+| `w` | open the wireless pairing panel (`enter` pairs/connects, `d` disconnects or forgets) |
 | `i` | install an APK across the current scope |
-| `/` | filter by substring (message or tag); `enter` applies, `esc` clears |
-| `p` / `space` | pause the log |
+| `/` | filter by substring (message or tag), plus `pid:N` tokens; `enter` applies, `esc` clears |
+| `p` | mute/unmute the selected device (device panel); pause the log (log panel) |
+| `space` | pause the log |
 | `c` | clear the buffer |
 | `r` | rescan for devices now |
 | `q` | quit |
