@@ -163,11 +163,13 @@ func (f *Fleet) tail(ctx context.Context, h *tailHandle, serial string, args []s
 		f.emit(Line{Serial: serial, Level: 'E', Tag: "lazyadb", Text: err.Error(), At: time.Now()})
 		return
 	}
-	defer stream.Close()
+	// Closing is how the tail is torn down, from either side; by then there
+	// is nothing useful to do with a close error.
+	defer func() { _ = stream.Close() }()
 
 	go func() {
 		<-ctx.Done()
-		stream.Close()
+		_ = stream.Close()
 	}()
 
 	_ = stream.Scan(func(raw string) {

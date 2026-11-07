@@ -143,10 +143,12 @@ func (s *Store) save() error {
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name())
+	// After a successful rename the temp file is gone, so this Remove fails
+	// with ENOENT by design. It only matters on the error paths.
+	defer func() { _ = os.Remove(tmp.Name()) }()
 
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close() // the write error is the one worth reporting
 		return err
 	}
 	if err := tmp.Close(); err != nil {

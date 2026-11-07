@@ -20,11 +20,12 @@ run: build
 test:
     go test ./...
 
-# Vet, format-check, and lint (golangci-lint if present, go vet otherwise).
+# Vet, format-check, and lint. golangci-lint findings fail the recipe when it
+# is installed; CI always runs it.
 lint:
     go vet ./...
     test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-    command -v golangci-lint >/dev/null && golangci-lint run || true
+    if command -v golangci-lint >/dev/null; then golangci-lint run; else echo "golangci-lint not installed; skipped (CI runs it)"; fi
 
 # Everything CI runs.
 check: lint test
